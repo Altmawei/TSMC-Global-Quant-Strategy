@@ -2,8 +2,8 @@ name: Daily Strategy Report
 
 on:
   schedule:
-    - cron: '45 0 * * 1-5' # 台灣時間週一至週五早上 08:45 (UTC 00:45)
-  workflow_dispatch: # 允許手動點擊執行
+    - cron: '45 0 * * 1-5' # 台灣時間週一至週五 08:45 自動執行
+  workflow_dispatch:      # 讓你可以點按鈕手動測試
 
 jobs:
   run-strategy:
