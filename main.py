@@ -33,20 +33,31 @@ class TAIFEX_Contest_V50:
         except: pass
 
     def _to_scalar(self, val):
-        """強制將任何 pandas 物件轉為單一浮點數"""
-        if isinstance(val, (pd.Series, pd.DataFrame)):
-            return float(val.iloc[-1]) if not val.empty else 0.0
-        return float(val)
+        """極強效轉型工具：處理 Series, DataFrame 或 MultiIndex 資料"""
+        try:
+            if isinstance(val, (pd.Series, pd.DataFrame)):
+                # 如果是多欄位，先取第一欄，再取最後一個值
+                temp = val.iloc[:, 0] if isinstance(val, pd.DataFrame) else val
+                return float(temp.iloc[-1])
+            return float(val)
+        except:
+            return 0.0
 
     def get_data(self):
         tickers = ["2330.TW", "TSM", "SOXX", "^TWII", "^TWOII", "TWD=X", "GC=F"]
         raw = yf.download(tickers, period="250d", progress=False)
+        
+        # 徹底拍平 MultiIndex
         if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(1)
+            raw.columns = raw.columns.get_level_values(-1)
+        
         df = raw.ffill()
 
         try:
             tw_vix = yf.download("^TWVIX", period="250d", progress=False)['Close']
+            # 處理可能出現的多欄位 VIX
+            if isinstance(tw_vix, pd.DataFrame):
+                tw_vix = tw_vix.iloc[:, 0]
             if tw_vix.dropna().empty: raise ValueError("Empty")
             df["^TWVIX"] = tw_vix
         except:
@@ -60,14 +71,14 @@ class TAIFEX_Contest_V50:
 
     def z_score(self, series, window=20):
         if len(series) < window: return 0.0
+        # 確保輸入是單一 Series
         s = series.iloc[:, 0] if isinstance(series, pd.DataFrame) else series
         tail = s.tail(window)
         std = tail.std()
-        if std < 1e-8 or np.isnan(std): return 0.0
+        if std < 1e-8 or np.isnan(std) or np.isinf(std): return 0.0
         return float((s.iloc[-1] - tail.mean()) / std)
 
     def factor_model(self, df):
-        # 輔助函數：確保取得單一 Series
         def get_s(name):
             col = df[name]
             return col.iloc[:, 0] if isinstance(col, pd.DataFrame) else col
@@ -76,20 +87,19 @@ class TAIFEX_Contest_V50:
         soxx = get_s("SOXX"); twii = get_s("^TWII"); twoii = get_s("^TWOII")
         vix = get_s("^TWVIX")
 
-        # 因子計算
+        # 使用自定義 z_score 確保回傳單一 float
         f1 = self.z_score((tsm / 5 * twd) / tsmc)
         f2 = self.z_score(soxx.pct_change())
         f3 = -self.z_score(vix)
         f4 = self.z_score(twoii / twii)
         f5 = -self.z_score(twd)
-        f6 = float(twii.pct_change().tail(10).mean() * 100)
+        f6 = self.z_score(twii.pct_change(), window=10) * 10 # 簡化平均計算
         
         basis = (twii * 1.002) - twii
         f7 = self.z_score(basis)
-        f8 = -float(vix.pct_change().tail(5).mean())
+        f8 = -self.z_score(vix.pct_change(), window=5)
         
-        # 這裡就是修正 ValueError 的地方：確保全是 float
-        factors = [float(f) for f in [f1, f2, f3, f4, f5, f6, f7, f8]]
+        factors = [self._to_scalar(f) for f in [f1, f2, f3, f4, f5, f6, f7, f8]]
         return np.nan_to_num(factors)
 
     def get_market_regime(self, df):
@@ -106,13 +116,13 @@ class TAIFEX_Contest_V50:
     def calculate_sizing(self, df, score):
         twii = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
         returns = twii.pct_change().dropna()
-        recent_vol = float(returns.tail(20).std())
+        recent_vol = self._to_scalar(returns.tail(20).std())
         if recent_vol < 1e-8: return 0.0
         lev = min(self.target_vol / recent_vol, 2.5)
         dd = (self.peak - self.balance) / self.peak
         if dd > 0.05: lev *= 0.5
         if dd > 0.10: lev = 0.0
-        edge = (min(abs(float(score)) / 3, 0.5)) * 0.5
+        edge = (min(abs(self._to_scalar(score)) / 3, 0.5)) * 0.5
         return float(self.balance * lev * edge)
 
     def generate_orders(self):
@@ -129,7 +139,7 @@ class TAIFEX_Contest_V50:
 
         tx = max(1, int(trade_cap / 2000000))
         mtx = max(1, int(trade_cap / 400000))
-        tsmc_f = max(0, int(trade_cap / (tsmc_last * 200)))
+        tsmc_f = max(0, int(trade_cap / (tsmc_last * 200 + 1)))
         
         call_strike = int(round(twii_last + 100, -2))
         put_strike = int(round(twii_last - 100, -2))
@@ -152,8 +162,8 @@ class TAIFEX_Contest_V50:
 
     def send_telegram(self, msg):
         if self.tg_token and self.tg_chat_id:
-            try: requests.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage", data={"chat_id": self.tg_chat_id, "text": msg}, timeout=5)
-            except Exception as e: print(f"TG Error: {e}")
+            try: requests.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage", data={"chat_id": self.tg_chat_id, "text": msg}, timeout=10)
+            except: pass
 
 if __name__ == "__main__":
     bot = TAIFEX_Contest_V50(); bot.report()
