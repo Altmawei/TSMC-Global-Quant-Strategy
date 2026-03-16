@@ -11,6 +11,7 @@ class TAIFEX_Contest_V50:
 
     def __init__(self, initial_capital=2000000):
         self.initial_capital = initial_capital
+        # 請確保這裡的檔名跟 GitHub 上的一致
         self.file = "strategy_report.csv"
         self.target_vol = 0.008 
         self.tg_token = os.getenv("TG_TOKEN")
@@ -33,11 +34,14 @@ class TAIFEX_Contest_V50:
         except: pass
 
     def get_data(self):
-        """針對台指 VIX 缺失，改用台股歷史波動率逆推，拒絕美股替代"""
+        """針對台指 VIX 缺失，改用台股歷史波動率逆推，修正 DataFrame 欄位報錯"""
         tickers = ["2330.TW", "TSM", "SOXX", "^TWII", "^TWOII", "TWD=X", "GC=F"]
         raw = yf.download(tickers, period="250d", progress=False)
+        
+        # 處理 yfinance 可能回傳的多層索引 (MultiIndex)
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(1)
+        
         df = raw.ffill()
 
         try:
@@ -45,38 +49,60 @@ class TAIFEX_Contest_V50:
             if tw_vix.dropna().empty: raise ValueError("Empty")
             df["^TWVIX"] = tw_vix
         except:
-            # 使用台股 HV 逆推 VIX (模擬台灣權證市場定價特性)
+            # --- 修正後的 VIX 擬合邏輯 (注意縮進與單欄位選取) ---
             print("警告：抓不到台指 VIX，啟動 HV 擬合演算法...")
-            # 確保只取 ^TWII 的欄位進行計算
-            tw_returns = df["^TWII"].pct_change()
-            if isinstance(tw_returns, pd.DataFrame):
-            tw_returns = tw_returns.iloc[:, 0]
-
+            
+            # 確保只抓 ^TWII 且是單一 Series
+            tw_price = df["^TWII"]
+            if isinstance(tw_price, pd.DataFrame):
+                tw_price = tw_price.iloc[:, 0]
+            
+            tw_returns = tw_price.pct_change()
+            
+            # 計算歷史波動率
             hv = tw_returns.rolling(20).std() * np.sqrt(252) * 100
-            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill()
+            
+            # 填補到 DataFrame
+            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill() 
 
         return df.dropna(subset=["^TWII"])
 
     def z_score(self, series, window=20):
         if len(series) < window: return 0
+        # 確保 series 是單一維度
+        if isinstance(series, pd.DataFrame):
+            series = series.iloc[:, 0]
         std = series.tail(window).std()
         if std < 1e-8 or np.isnan(std): return 0
         return (series.iloc[-1] - series.tail(window).mean()) / std
 
     def factor_model(self, df):
-        adr = (df["TSM"] / 5 * df["TWD=X"]) / df["2330.TW"]
-        f1 = self.z_score(adr); f2 = self.z_score(df["SOXX"].pct_change())
+        # 計算 ADR 溢價 (確保取單一欄位以免運算噴錯)
+        tsm = df["TSM"].iloc[:, 0] if isinstance(df["TSM"], pd.DataFrame) else df["TSM"]
+        twd = df["TWD=X"].iloc[:, 0] if isinstance(df["TWD=X"], pd.DataFrame) else df["TWD=X"]
+        tsmc = df["2330.TW"].iloc[:, 0] if isinstance(df["2330.TW"], pd.DataFrame) else df["2330.TW"]
+        
+        adr = (tsm / 5 * twd) / tsmc
+        
+        f1 = self.z_score(adr)
+        f2 = self.z_score(df["SOXX"].pct_change())
         f3 = -self.z_score(df["^TWVIX"])
         f4 = self.z_score(df["^TWOII"] / df["^TWII"])
         f5 = -self.z_score(df["TWD=X"])
         f6 = df["^TWII"].pct_change().tail(10).mean() * 100
-        basis = (df["^TWII"] * 1.002) - df["^TWII"]
+        
+        idx_p = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+        basis = (idx_p * 1.002) - idx_p
         f7 = self.z_score(basis)
-        f8 = -df["^TWVIX"].pct_change().tail(5).mean()
+        
+        vix_p = df["^TWVIX"].iloc[:, 0] if isinstance(df["^TWVIX"], pd.DataFrame) else df["^TWVIX"]
+        f8 = -vix_p.pct_change().tail(5).mean()
+        
         return np.nan_to_num([f1, f2, f3, f4, f5, f6, f7, f8])
 
     def get_market_regime(self, df):
-        ret = df["^TWII"].pct_change().fillna(0)
+        idx_p = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+        ret = idx_p.pct_change().fillna(0)
         vol = ret.rolling(20).std().fillna(0)
         X = np.column_stack([ret.tail(150), vol.tail(150)])
         scaler = StandardScaler(); X_scaled = scaler.fit_transform(X)
@@ -86,10 +112,10 @@ class TAIFEX_Contest_V50:
         return ["panic", "bear", "range", "bull"][rank]
 
     def calculate_sizing(self, df, score):
-        returns = df["^TWII"].pct_change().dropna()
+        idx_p = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+        returns = idx_p.pct_change().dropna()
         recent_vol = returns.tail(20).std()
         if recent_vol < 1e-8: return 0
-        # 實戰限制：槓桿降至 2.5，採半凱利原則 (0.5 倍)
         lev = min(self.target_vol / recent_vol, 2.5)
         dd = (self.peak - self.balance) / self.peak
         if dd > 0.05: lev *= 0.5
@@ -102,18 +128,24 @@ class TAIFEX_Contest_V50:
         if df.empty: return "error", "N/A", 0, 0
         factors = self.factor_model(df); score = np.mean(factors)
         regime = self.get_market_regime(df)
-        idx_price = df["^TWII"].iloc[-1]
+        
+        idx_price_val = df["^TWII"].iloc[-1]
+        if isinstance(idx_price_val, pd.Series):
+            idx_price_val = idx_price_val.iloc[0]
+            
         trade_cap = self.calculate_sizing(df, score)
         if abs(score) < 0.15: regime = "neutral"
 
-        # 單位計算
         tx = max(1, int(trade_cap / 2000000))
         mtx = max(1, int(trade_cap / 400000))
-        tsmc_f = max(0, int(trade_cap / (df["2330.TW"].iloc[-1] * 200)))
         
-        # 選擇權履約價計算 (四捨五入至百位數)
-        call_strike = int(round(idx_price + 100, -2))
-        put_strike = int(round(idx_price - 100, -2))
+        tsmc_price = df["2330.TW"].iloc[-1]
+        if isinstance(tsmc_price, pd.Series):
+            tsmc_price = tsmc_price.iloc[0]
+        tsmc_f = max(0, int(trade_cap / (tsmc_price * 200)))
+        
+        call_strike = int(round(idx_price_val + 100, -2))
+        put_strike = int(round(idx_price_val - 100, -2))
 
         if regime == "bull":
             orders = f"TX多 {tx}口 | MTX多 {mtx}口 | 台積期多 {tsmc_f}口\nOPT: 買入週台指 Call @ {call_strike}"
@@ -124,7 +156,7 @@ class TAIFEX_Contest_V50:
         else:
             orders = "低波動模式 | 僅微台 1 口維持參賽資格"
 
-        return regime, orders, score, df["2330.TW"].iloc[-1]
+        return regime, orders, score, tsmc_price
 
     def report(self):
         regime, orders, score, price = self.generate_orders()
