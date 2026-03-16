@@ -47,8 +47,13 @@ class TAIFEX_Contest_V50:
         except:
             # 使用台股 HV 逆推 VIX (模擬台灣權證市場定價特性)
             print("警告：抓不到台指 VIX，啟動 HV 擬合演算法...")
-            hv = df["^TWII"].pct_change().rolling(20).std() * np.sqrt(252) * 100
-            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill() # 針對台股波動補償
+            # 確保只取 ^TWII 的欄位進行計算
+            tw_returns = df["^TWII"].pct_change()
+            if isinstance(tw_returns, pd.DataFrame):
+            tw_returns = tw_returns.iloc[:, 0]
+
+            hv = tw_returns.rolling(20).std() * np.sqrt(252) * 100
+            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill()
 
         return df.dropna(subset=["^TWII"])
 
