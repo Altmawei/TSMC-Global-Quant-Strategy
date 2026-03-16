@@ -11,7 +11,7 @@ class TAIFEX_Contest_V50:
 
     def __init__(self, initial_capital=2000000):
         self.initial_capital = initial_capital
-        self.file = "contest_equity.csv"
+        self.file = "strategy_report.csv"
         self.target_vol = 0.008 
         self.tg_token = os.getenv("TG_TOKEN")
         self.tg_chat_id = os.getenv("TG_CHAT_ID")
