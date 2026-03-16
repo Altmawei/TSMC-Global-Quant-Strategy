@@ -1,0 +1,33 @@
+name: Daily Strategy Report
+
+on:
+  schedule:
+    - cron: '45 0 * * 1-5' # 台灣時間週一至週五早上 08:45 (UTC 00:45)
+  workflow_dispatch: # 允許手動點擊執行
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install numpy yfinance pandas
+
+      - name: Run strategy
+        run: python main.py
+
+      - name: Commit and push CSV report
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add strategy_report.csv
+          git commit -m "Update daily strategy report" || echo "No changes to commit"
+          git push
