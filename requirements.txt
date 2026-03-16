@@ -1,3 +1,5 @@
 numpy
-yfinance
 pandas
+yfinance
+scikit-learn
+requests
