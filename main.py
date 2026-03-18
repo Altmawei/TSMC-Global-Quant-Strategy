@@ -38,7 +38,7 @@ class TAIFEX_Contest_V50:
         except: pass
 
     def _to_scalar(self, val):
-        """核心修正：強制將任何格式轉為單一浮點數，解決 TypeError"""
+        """極強效轉型：解決 TypeError"""
         try:
             if isinstance(val, (pd.Series, pd.DataFrame)):
                 v = val.iloc[-1]
@@ -51,8 +51,6 @@ class TAIFEX_Contest_V50:
     def get_data(self):
         tickers = ["2330.TW", "TSM", "SOXX", "^TWII", "^TWOII", "TWD=X", "GC=F"]
         raw = yf.download(tickers, period="300d", progress=False)
-        
-        # 強制拍平 MultiIndex 結構
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(-1)
         
@@ -60,26 +58,25 @@ class TAIFEX_Contest_V50:
         df = raw.ffill().ewm(span=5, adjust=False).mean()
 
         try:
-            vix_data = yf.download("^TWVIX", period="300d", progress=False)
-            if vix_data.empty: raise ValueError("VIX Empty")
-            # 確保取到的是單一數列
-            tw_vix = vix_data['Close']
-            if isinstance(tw_vix, pd.DataFrame): tw_vix = tw_vix.iloc[:, 0]
-            df["^TWVIX"] = tw_vix.ffill()
+            vix_raw = yf.download("^TWVIX", period="300d", progress=False)
+            if vix_raw.empty: raise ValueError("VIX Empty")
+            v_close = vix_raw['Close']
+            if isinstance(v_close, pd.DataFrame): v_close = v_close.iloc[:, 0]
+            df["^TWVIX"] = v_close.ffill()
         except:
-            # 第三張圖的修正：確保擬合的 VIX 是單一數列格式
-            tw_price = df["^TWII"]
-            if isinstance(tw_price, pd.DataFrame): tw_price = tw_price.iloc[:, 0]
-            hv = tw_price.pct_change().rolling(20).std() * np.sqrt(252) * 100
-            df["^TWVIX"] = hv.ffill() * 1.15 + 1.5 
+            # 修正 ValueError: 確保備用 VIX 是一維的
+            tw_p = df["^TWII"]
+            if isinstance(tw_p, pd.DataFrame): tw_p = tw_p.iloc[:, 0]
+            hv = tw_p.pct_change().rolling(20).std() * np.sqrt(252) * 100
+            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill()
 
         return df.dropna(subset=["^TWII"])
 
-    def z_score(self, s, w=20):
-        if len(s) < w: return 0.0
-        # 強制轉換格式
+    def z_score(self, s, window=20):
+        """修正參數對齊問題"""
+        if len(s) < window: return 0.0
         target = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
-        tail = target.tail(w)
+        tail = target.tail(window)
         std = tail.std()
         if std < 1e-8 or np.isnan(std): return 0.0
         return float((self._to_scalar(target) - tail.mean()) / std)
@@ -87,13 +84,10 @@ class TAIFEX_Contest_V50:
     def get_optimized_weights(self, df):
         try:
             lookback = 60
-            # 確保參與運算的都是單一數列
             idx = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
             y = idx.pct_change().shift(-1).dropna().tail(lookback)
-            
             f1_h = (df["TSM"]/5 * df["TWD=X"] / df["2330.TW"]).pct_change().tail(lookback)
             f2_h = df["SOXX"].pct_change().tail(lookback)
-            
             X = np.column_stack([f1_h.values, f2_h.values])
             model = Ridge(alpha=1.0).fit(X, y.values)
             w = np.abs(model.coef_)
@@ -101,7 +95,6 @@ class TAIFEX_Contest_V50:
         except: return np.array([0.5, 0.5])
 
     def factor_model(self, df):
-        # 因子計算
         f1 = self.z_score((df["TSM"] / 5 * df["TWD=X"]) / df["2330.TW"])
         f2 = self.z_score(df["SOXX"].pct_change())
         f3 = -self.z_score(df["^TWVIX"])
@@ -111,16 +104,14 @@ class TAIFEX_Contest_V50:
         f7 = self.z_score((df["^TWII"] * 1.002) - df["^TWII"])
         f8 = -self.z_score(df["^TWVIX"].pct_change(), window=5)
         
-        # 每日自動權重更新
         dyn_w = self.get_optimized_weights(df)
         score_core = f1 * dyn_w[0] + f2 * dyn_w[1]
         score_others = np.mean([f3, f4, f5, f6, f7, f8])
         
-        # ARIMA(1,1,1) 去噪趨勢預測
         try:
-            target_series = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
-            arima_mod = ARIMA(target_series.tail(100), order=(1, 1, 1)).fit()
-            f_arima = 1 if arima_mod.forecast(steps=1).iloc[0] > self._to_scalar(target_series) else -1
+            t_series = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+            arima_fit = ARIMA(t_series.tail(100), order=(1, 1, 1)).fit()
+            f_arima = 1 if arima_fit.forecast(steps=1).iloc[0] > self._to_scalar(t_series) else -1
         except: f_arima = 0
 
         final_score = (score_core * 0.4) + (score_others * 0.4) + (f_arima * 0.2)
@@ -128,8 +119,8 @@ class TAIFEX_Contest_V50:
         return final_score, details
 
     def get_market_regime(self, df):
-        price = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
-        ret = price.pct_change().fillna(0)
+        p = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+        ret = p.pct_change().fillna(0)
         vol = ret.rolling(20).std().fillna(0)
         X = np.column_stack([ret.tail(150), vol.tail(150)])
         scaler = StandardScaler(); X_scaled = scaler.fit_transform(X)
@@ -141,18 +132,15 @@ class TAIFEX_Contest_V50:
     def generate_orders(self):
         df = self.get_data()
         if df.empty: return "error", "N/A", 0.0, 0.0, {}
-        
         score, details = self.factor_model(df)
         regime = self.get_market_regime(df)
-        twii_last = self._to_scalar(df["^TWII"])
         tsmc_last = self._to_scalar(df["2330.TW"])
-        
         is_active = abs(score) >= 0.08
         trade_cap = float(self.balance * 0.8 * (min(abs(score)/2, 0.5)))
         mtx = max(1, int(trade_cap / 400000))
 
         if not is_active:
-            orders = "【中性盤整】自動補單 | 微台(MTX) 1口"
+            orders = "【中性模式】補單參賽 | MTX多 1口"
         elif regime == "bull":
             orders = f"【趨勢看多】MTX多 {mtx}口 | 加碼台積期"
         elif regime == "panic":
@@ -166,13 +154,11 @@ class TAIFEX_Contest_V50:
         sender = 'jeffreylin1201@gmail.com'
         receivers = ['jeffreylin1201@gmail.com', 'allenbowei@gmail.com'] 
         password = 'udcgkrdfdfoqznsn' 
-        message = MIMEText(content, 'plain', 'utf-8')
-        message['From'] = Header("V50 Strategy AI", 'utf-8')
-        message['Subject'] = Header(f"V50 進階戰報: {datetime.now().strftime('%m/%d')}", 'utf-8')
+        msg = MIMEText(content, 'plain', 'utf-8')
+        msg['Subject'] = Header(f"V50 每日權重戰報: {datetime.now().strftime('%m/%d')}", 'utf-8')
         try:
-            smtp_obj = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-            smtp_obj.login(sender, password)
-            smtp_obj.sendmail(sender, receivers, message.as_string())
+            s = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+            s.login(sender, password); s.sendmail(sender, receivers, msg.as_string())
         except: pass
 
     def report(self):
@@ -183,16 +169,13 @@ class TAIFEX_Contest_V50:
             f"🔍 狀態: {regime.upper()} | 分數: {score:.4f}\n"
             f"📈 ARIMA: {'BULL' if details.get('ARIMA')==1 else 'BEAR'}\n"
             f"⚖️ ADR權重: {details.get('W_ADR', 0):.2%}\n"
-            f"--------------------------------\n"
             f"⚡ 指令: {orders}\n"
             f"💰 餘額: {int(self.balance):,} TWD"
         )
-        print(msg)
-        self.send_email(msg)
+        print(msg); self.send_email(msg)
         if self.tg_token and self.tg_chat_id:
-            try: requests.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage", data={"chat_id": self.tg_chat_id, "text": msg}, timeout=10)
-            except: pass
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage", data={"chat_id": self.tg_chat_id, "text": msg})
         self.save_equity()
 
 if __name__ == "__main__":
-    bot = TAIFEX_Contest_V50(); bot.report()
+    TAIFEX_Contest_V50().report()
