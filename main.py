@@ -38,24 +38,21 @@ class TAIFEX_Contest_V50:
         except: pass
 
     def _to_scalar(self, val):
-        """強化轉型工具：處理 Series, DataFrame 或 MultiIndex"""
+        """核心修正：強制將任何格式轉為單一浮點數，解決 TypeError"""
         try:
             if isinstance(val, (pd.Series, pd.DataFrame)):
-                # 優先取最後一個值
-                temp = val.iloc[-1]
-                # 如果還是 Series (MultiIndex 情況), 再取一次
-                if isinstance(temp, pd.Series):
-                    temp = temp.iloc[0]
-                return float(temp)
+                v = val.iloc[-1]
+                while isinstance(v, (pd.Series, pd.DataFrame)):
+                    v = v.iloc[0]
+                return float(v)
             return float(val)
-        except:
-            return 0.0
+        except: return 0.0
 
     def get_data(self):
         tickers = ["2330.TW", "TSM", "SOXX", "^TWII", "^TWOII", "TWD=X", "GC=F"]
         raw = yf.download(tickers, period="300d", progress=False)
         
-        # 徹底拍平 MultiIndex 避免轉型錯誤
+        # 強制拍平 MultiIndex 結構
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(-1)
         
@@ -63,23 +60,24 @@ class TAIFEX_Contest_V50:
         df = raw.ffill().ewm(span=5, adjust=False).mean()
 
         try:
-            # 嘗試抓取 VIX，失敗則啟動 HV 擬合
-            vix_raw = yf.download("^TWVIX", period="300d", progress=False)
-            if vix_raw.empty: raise ValueError("VIX Empty")
-            tw_vix = vix_raw['Close']
+            vix_data = yf.download("^TWVIX", period="300d", progress=False)
+            if vix_data.empty: raise ValueError("VIX Empty")
+            # 確保取到的是單一數列
+            tw_vix = vix_data['Close']
             if isinstance(tw_vix, pd.DataFrame): tw_vix = tw_vix.iloc[:, 0]
             df["^TWVIX"] = tw_vix.ffill()
         except:
-            # 使用 ^TWII 算歷史波動率擬合 VIX
+            # 第三張圖的修正：確保擬合的 VIX 是單一數列格式
             tw_price = df["^TWII"]
+            if isinstance(tw_price, pd.DataFrame): tw_price = tw_price.iloc[:, 0]
             hv = tw_price.pct_change().rolling(20).std() * np.sqrt(252) * 100
-            df["^TWVIX"] = (hv * 1.15 + 1.5).ffill() 
+            df["^TWVIX"] = hv.ffill() * 1.15 + 1.5 
 
         return df.dropna(subset=["^TWII"])
 
     def z_score(self, s, w=20):
         if len(s) < w: return 0.0
-        # 確保取到的是單一數列
+        # 強制轉換格式
         target = s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         tail = target.tail(w)
         std = tail.std()
@@ -89,19 +87,21 @@ class TAIFEX_Contest_V50:
     def get_optimized_weights(self, df):
         try:
             lookback = 60
-            y = df["^TWII"].pct_change().shift(-1).dropna().tail(lookback)
-            # 核心因子回歸
+            # 確保參與運算的都是單一數列
+            idx = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+            y = idx.pct_change().shift(-1).dropna().tail(lookback)
+            
             f1_h = (df["TSM"]/5 * df["TWD=X"] / df["2330.TW"]).pct_change().tail(lookback)
             f2_h = df["SOXX"].pct_change().tail(lookback)
-            X = np.column_stack([f1_h, f2_h])
-            model = Ridge(alpha=1.0).fit(X, y)
+            
+            X = np.column_stack([f1_h.values, f2_h.values])
+            model = Ridge(alpha=1.0).fit(X, y.values)
             w = np.abs(model.coef_)
             return w / (np.sum(w) + 1e-8)
-        except:
-            return np.array([0.5, 0.5])
+        except: return np.array([0.5, 0.5])
 
     def factor_model(self, df):
-        # 8 大因子計算 (加入 _to_scalar 保護)
+        # 因子計算
         f1 = self.z_score((df["TSM"] / 5 * df["TWD=X"]) / df["2330.TW"])
         f2 = self.z_score(df["SOXX"].pct_change())
         f3 = -self.z_score(df["^TWVIX"])
@@ -111,13 +111,16 @@ class TAIFEX_Contest_V50:
         f7 = self.z_score((df["^TWII"] * 1.002) - df["^TWII"])
         f8 = -self.z_score(df["^TWVIX"].pct_change(), window=5)
         
+        # 每日自動權重更新
         dyn_w = self.get_optimized_weights(df)
         score_core = f1 * dyn_w[0] + f2 * dyn_w[1]
         score_others = np.mean([f3, f4, f5, f6, f7, f8])
         
+        # ARIMA(1,1,1) 去噪趨勢預測
         try:
-            arima_mod = ARIMA(df["^TWII"].tail(100), order=(1, 1, 1))
-            f_arima = 1 if arima_mod.fit().forecast(steps=1).iloc[0] > self._to_scalar(df["^TWII"]) else -1
+            target_series = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
+            arima_mod = ARIMA(target_series.tail(100), order=(1, 1, 1)).fit()
+            f_arima = 1 if arima_mod.forecast(steps=1).iloc[0] > self._to_scalar(target_series) else -1
         except: f_arima = 0
 
         final_score = (score_core * 0.4) + (score_others * 0.4) + (f_arima * 0.2)
@@ -125,7 +128,6 @@ class TAIFEX_Contest_V50:
         return final_score, details
 
     def get_market_regime(self, df):
-        # 確保取到單一數列
         price = df["^TWII"].iloc[:, 0] if isinstance(df["^TWII"], pd.DataFrame) else df["^TWII"]
         ret = price.pct_change().fillna(0)
         vol = ret.rolling(20).std().fillna(0)
@@ -150,7 +152,7 @@ class TAIFEX_Contest_V50:
         mtx = max(1, int(trade_cap / 400000))
 
         if not is_active:
-            orders = "【中性模式】補單參賽 | MTX多 1口"
+            orders = "【中性盤整】自動補單 | 微台(MTX) 1口"
         elif regime == "bull":
             orders = f"【趨勢看多】MTX多 {mtx}口 | 加碼台積期"
         elif regime == "panic":
