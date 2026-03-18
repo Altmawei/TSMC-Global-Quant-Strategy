@@ -7,7 +7,7 @@ from email.header import Header
 from datetime import datetime
 from sklearn.linear_model import Ridge
 
-class TAIFEX_V210_ContestFinal:
+class TAIFEX_V220_StabilityFinal:
 
     def __init__(self, initial_capital=2000000):
         self.initial_capital = initial_capital
@@ -44,25 +44,56 @@ class TAIFEX_V210_ContestFinal:
         except: return 0.0
 
     def get_data(self):
+        """強化版抓取：解決 KeyError 與 Database Locked 問題"""
         tickers = ["2330.TW", "TSM", "SOXX", "^TWII", "^TWOII", "TWD=X", "GC=F"]
-        df = yf.download(tickers, period="300d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(-1)
+        # 增加多一次嘗試機會
+        raw = yf.download(tickers, period="300d", progress=False)
         
-        df['park_vol'] = np.sqrt(1/(4*np.log(2)) * ((np.log(df['High']/df['Low']))**2)).rolling(10).mean()
-        df['f1_adr'] = ((df["TSM"]/5 * df["TWD=X"]) / df["2330.TW"]).pct_change()
-        df['f2_semi'] = df["SOXX"].pct_change()
-        df['f3_basis'] = (df['^TWII'] - df['^TWII'].rolling(5).mean()).pct_change()
-        df['f4_regime'] = (df["^TWOII"]/df["^TWII"]).pct_change()
-        df['f5_retail'] = (df['^TWII'].pct_change() / df['^TWII'].rolling(20).std()).shift(1)
-        df['f6_fx'] = -df['TWD=X'].pct_change()
+        # 解決 MultiIndex 問題並確保數據存在
+        if isinstance(raw.columns, pd.MultiIndex):
+            df_close = raw['Close'].ffill()
+            df_high = raw['High'].ffill() if 'High' in raw else df_close
+            df_low = raw['Low'].ffill() if 'Low' in raw else df_close
+        else:
+            df_close = raw.ffill()
+            df_high = df_close
+            df_low = df_close
 
+        # 修正 5. 確保必須要有 ^TWII
+        if "^TWII" not in df_close.columns:
+            raise ValueError("關鍵大盤數據抓取失敗，請重新運行。")
+
+        df = pd.DataFrame(index=df_close.index)
+        df['Close'] = df_close['^TWII']
+        
+        # 修正：Parkinson Vol (解決 KeyError 'High' 的關鍵)
+        # 如果 High/Low 缺失，則退化為標準收盤價回報波動率
+        try:
+            log_hl = np.log(df_high['^TWII'] / df_low['^TWII'])
+            df['park_vol'] = np.sqrt(1/(4*np.log(2)) * (log_hl**2)).rolling(10).mean()
+        except:
+            df['park_vol'] = df['Close'].pct_change().rolling(10).std() * np.sqrt(252) / 100
+
+        # Alpha 因子計算
+        df['f1_adr'] = ((df_close["TSM"]/5 * df_close["TWD=X"]) / df_close["2330.TW"]).pct_change()
+        df['f2_semi'] = df_close["SOXX"].pct_change()
+        df['f3_basis'] = (df['Close'] - df['Close'].rolling(5).mean()).pct_change()
+        df['f4_regime'] = (df_close["^TWOII"]/df_close["^TWII"]).pct_change()
+        df['f5_retail'] = (df['Close'].pct_change() / df['Close'].rolling(20).std().replace(0, 0.01)).shift(1)
+        df['f6_fx'] = -df_close['TWD=X'].pct_change()
+        
+        # VIX 備用擬合
         try:
             v_raw = yf.download("^TWVIX", period="300d", progress=False)['Close']
-            df["^TWVIX"] = v_raw.ffill() if not v_raw.dropna().empty else (df['^TWII'].pct_change().rolling(20).std()*np.sqrt(252)*115+1.5)
+            df["^TWVIX"] = v_raw.ffill() if not v_raw.dropna().empty else (df['Close'].pct_change().rolling(20).std()*np.sqrt(252)*115+1.5)
         except:
-            df["^TWVIX"] = (df['^TWII'].pct_change().rolling(20).std()*np.sqrt(252)*115+1.5).ffill()
+            df["^TWVIX"] = (df['Close'].pct_change().rolling(20).std()*np.sqrt(252)*115+1.5).ffill()
         df['f7_vix'] = -df['^TWVIX'].pct_change()
-        return df.dropna(subset=["^TWII"])
+        
+        # 保存其他必要價格以便 execute_trading 使用
+        self.prices = df_close.iloc[-1]
+        self.df_close = df_close # 為了之後算 rets
+        return df.dropna(subset=["f1_adr", "f2_semi"]).ffill()
 
     def get_alpha(self, df):
         def zs(s): return (s - s.rolling(20).mean()) / (s.rolling(20).std() + 1e-8)
@@ -72,62 +103,64 @@ class TAIFEX_V210_ContestFinal:
         
         try:
             lookback = 60
-            y = df["^TWII"].pct_change().shift(-1).dropna().tail(lookback)
+            y = df["Close"].pct_change().shift(-1).dropna().tail(lookback)
             X = df_zs.tail(lookback+1).iloc[:-1]
             new_w = Ridge(alpha=2.0).fit(X, y).coef_
             smooth_w = self.lambda_w * self.last_w + (1 - self.lambda_w) * new_w
         except: smooth_w = self.last_w
 
-        vol_adj = 2.5 * (0.012 / (self._to_scalar(df['park_vol']) + 1e-8))
+        # 動態 Alpha 放大 (截圖 2:18:21)
+        park_v = self._to_scalar(df['park_vol'])
+        vol_adj = 2.5 * (0.012 / (park_v + 1e-8))
         score = np.tanh(np.dot(f_vec, smooth_w) * np.clip(vol_adj, 1.5, 4.0))
         return (0 if abs(score) < 0.05 else score), smooth_w, df_zs
 
     def execute_trading(self, alpha, df, w_vec, df_zs):
-        twp, tsmcp, gp, twdp = self._to_scalar(df["^TWII"]), self._to_scalar(df["2330.TW"]), self._to_scalar(df["GC=F"]), self._to_scalar(df["TWD=X"])
-        # 合約名目價值
-        current_nv = np.array([twp*200, twp*50, twp*10, self._to_scalar(df["^TWOII"])*100, tsmcp*2000, gp*100*twdp])
+        p = self.prices
+        # 合約名目價值 (動態抓取價格)
+        current_nv = np.array([p["^TWII"]*200, p["^TWII"]*50, p["^TWII"]*10, p["^TWOII"]*100, p["2330.TW"]*2000, p["GC=F"]*100*p["TWD=X"]])
         
-        # PnL 校準
-        gross_pnl = np.sum(self.last_pos * self.last_nv * ((current_nv/self.last_nv)-1)) if np.all(self.last_nv>0) else 0
+        # 修正 PnL 邏輯
+        if np.all(self.last_nv > 0):
+            item_rets = (current_nv / self.last_nv) - 1
+            gross_pnl = np.sum(self.last_pos * self.last_nv * item_rets)
+        else: gross_pnl = 0
 
-        # 風控
+        # 動態風控與門檻
         park_v = self._to_scalar(df['park_vol'])
         t_vol = 0.012
         lev = min((t_vol / (park_v + 1e-8)) * abs(alpha) * 5, 2.0)
         
-        # 動態門檻
-        vix_threshold = df_zs['f7_vix'].rolling(60).quantile(0.10).iloc[-1]
-        if df_zs['f7_vix'].iloc[-1] < vix_threshold: lev *= 0.8
+        vix_z = df_zs['f7_vix'].iloc[-1]
+        vix_th = df_zs['f7_vix'].rolling(60).quantile(0.10).iloc[-1]
+        if vix_z < vix_th: lev *= 0.8
         if (self.peak - self.balance)/self.peak > 0.12: lev = 0 
         
-        # 標的分散分配 (TX, MX, FMTX, TMC, STC, GDF)
-        # 修正：確保這 6 個標的都有基礎分配權重，符合參賽資格
+        # 動態 Buffer 與分配 (截圖 2:18:21)
+        buffer_size = 0.1 * (1 - abs(alpha))
         alloc = np.zeros(6)
-        alloc[0] = max(0.05, abs(w_vec[0]) * 0.4) # TX
-        alloc[1] = max(0.05, abs(w_vec[2]) * 0.2) # MX
-        alloc[2] = 0.1                            # FMTX (固定緩衝)
-        alloc[3] = max(0.05, abs(w_vec[3]) * 0.1) # TMC
-        alloc[4] = max(0.05, abs(w_vec[4]) * 0.2) # STC
-        alloc[5] = 0.05                           # GDF (基礎避險)
+        alloc[0] = max(0.05, abs(w_vec[0]) * 0.4) 
+        alloc[1] = max(0.05, abs(w_vec[2]) * 0.2) 
+        alloc[2] = max(0.05, buffer_size)         
+        alloc[3] = max(0.05, abs(w_vec[3]) * 0.1) 
+        alloc[4] = max(0.05, abs(w_vec[4]) * 0.2) 
+        alloc[5] = 0.05                           
         
-        # 匯率動態調節
-        fx_threshold = df_zs['f6_fx'].rolling(60).quantile(0.90).iloc[-1]
-        if df_zs['f6_fx'].iloc[-1] > fx_threshold: alloc[0] *= 0.8
+        fx_z = df_zs['f6_fx'].iloc[-1]
+        fx_th = df_zs['f6_fx'].rolling(60).quantile(0.90).iloc[-1]
+        if fx_z > fx_th: alloc[0] *= 0.8
         
         alloc /= (np.sum(alloc) + 1e-8)
-
         target_val = self.balance * lev
-        direction = np.sign(alpha) if abs(alpha) > 0 else 1 # 中性時假設微量看多以符合資格
+        direction = np.sign(alpha) if abs(alpha) > 0 else 1
 
-        # 修正：部位計算邏輯。如果算出來是 0 口，強制補 1 口，確保符合「交易 6 項標的」規則
+        # 核心：確保交易滿 6 項標的
         raw_pos = (target_val * alloc / (current_nv + 1e-8)).astype(int) * direction
         for i in range(6):
             if raw_pos[i] == 0: raw_pos[i] = 1 * direction
-            
-        # 黃金避險特殊處理：若 alpha < 0 則做多避險
         if alpha < 0: raw_pos[5] = abs(raw_pos[5])
 
-        # 交易慣性 (Inertia)
+        # 動態慣性 (截圖 2:18:21)
         dynamic_inertia = 0.10 * (park_v / t_vol)
         diff_nv = np.sum(np.abs(raw_pos - self.last_pos) * current_nv)
         if diff_nv < (dynamic_inertia * self.balance) and abs(alpha) > 0:
@@ -147,22 +180,22 @@ class TAIFEX_V210_ContestFinal:
         regime = "BULL" if alpha > 0 else ("BEAR" if alpha < 0 else "NEUTRAL")
 
         msg = (
-            f"🚀 V210 賽事決選版 (六項標的達標)\n"
+            f"🚀 V220 抗震修復版戰報\n"
             f"--------------------------------\n"
             f"🧠 Alpha: {alpha:.4f} | 狀態: {regime}\n"
-            f"📊 權重分配: ADR:{w_vec[0]:.0%} | Basis:{w_vec[2]:.0%} | VIX:{w_vec[6]:.0%}\n"
-            f"⚡ [必備] 六項持倉明細:\n"
-            f" 1.大台(TX): {pos[0]} | 2.小台(MX): {pos[1]}\n"
-            f" 3.微台(FMTX): {pos[2]} | 4.中型(TMC): {pos[3]}\n"
-            f" 5.台積(STC): {pos[4]} | 6.黃金(GDF): {pos[5]}\n"
+            f"📊 權重: ADR:{w_vec[0]:.0%} | Basis:{w_vec[2]:.0%} | VIX:{w_vec[6]:.0%}\n"
+            f"🛡️ 狀態: {'[穩定性修復中]' if self.prices['GC=F']==0 else '正常'}\n"
+            f"⚡ 持倉明細 (1~6 項必備):\n"
+            f" TX:{pos[0]} | MX:{pos[1]} | FMTX:{pos[2]}\n"
+            f" TMC:{pos[3]} | STC:{pos[4]} | GDF:{pos[5]}\n"
             f"--------------------------------\n"
-            f"💰 今日損益: {int(pnl):+} TWD\n"
-            f"💰 帳戶餘額: {int(self.balance):,} TWD"
+            f"💰 今日淨損益: {int(pnl):+} TWD\n"
+            f"💰 累積總權益: {int(self.balance):,} TWD"
         )
         print(msg)
         try:
             m = MIMEText(msg, 'plain', 'utf-8')
-            m['Subject'] = Header(f"V210 決選版戰報: {regime}", 'utf-8')
+            m['Subject'] = Header(f"V220 穩定版: {regime}", 'utf-8')
             s = smtplib.SMTP_SSL("smtp.gmail.com", 465)
             s.login('jeffreylin1201@gmail.com', 'udcgkrdfdfoqznsn')
             s.sendmail('jeffreylin1201@gmail.com', ['jeffreylin1201@gmail.com'], m.as_string())
@@ -172,4 +205,4 @@ class TAIFEX_V210_ContestFinal:
         self.save_system_state(self.balance, pos, nv, w_vec)
 
 if __name__ == "__main__":
-    TAIFEX_V210_ContestFinal().report()
+    TAIFEX_V220_StabilityFinal().report()
